@@ -77,6 +77,17 @@ static bool RedirectLegacyName(const char *file, char *out, size_t cb)
 
 // ---------------------------------------------------------------- level 2: inline hooks
 
+// The d3d9 entry-point patch is OFF unless FSR41_PATCH_D3D9=1 is set in the
+// environment: it is a 1.61 experiment, and that engine checksums the loaded
+// d3d9 module -- patched bytes make it abort before any video init.
+static bool PatchD3D9ExportEnabled()
+{
+    char v[8] = {};
+    return GetEnvironmentVariableA("FSR41_PATCH_D3D9", v, sizeof v) > 0 && v[0] == '1';
+}
+
+static void EnsureD3D9Patched();  // defined below -- called from the diversion paths
+
 static HMODULE (WINAPI *RealLoadLibraryA)(LPCSTR)  = nullptr;
 static HMODULE (WINAPI *RealLoadLibraryW)(LPCWSTR) = nullptr;
 static HMODULE (WINAPI *RealLoadLibraryExA)(LPCSTR, HANDLE, DWORD)  = nullptr;
@@ -88,7 +99,11 @@ static HMODULE WINAPI MyLoadLibraryA(LPCSTR file)
     if (RedirectLegacyName(file, redirect, sizeof redirect) && _stricmp(file, redirect) != 0)
     {
         Trace("LoadLibraryA", file, redirect);
+        const bool d3d9 = strlen(redirect) >= 8 && _stricmp(redirect + strlen(redirect) - 8, "d3d9.dll") == 0;
         file = redirect;
+        HMODULE h = RealLoadLibraryA(file);
+        if (d3d9 && h != nullptr && PatchD3D9ExportEnabled()) EnsureD3D9Patched();
+        return h;
     }
     return RealLoadLibraryA(file);
 }
@@ -132,8 +147,6 @@ static HMODULE WINAPI MyLoadLibraryExW(LPCWSTR file, HANDLE h, DWORD flags)
     return RealLoadLibraryExW(file, h, flags);
 }
 
-static void InstallD3D9Hooks();   // defined below -- called once hooks are up
-
 static void InstallInlineHooks()
 {
     static bool tried = false;
@@ -161,7 +174,9 @@ static void InstallInlineHooks()
         }
     }
     Trace("hooks: LoadLibraryA/W/ExA/ExW armed", "", nullptr);
-    InstallD3D9Hooks();
+    // The Direct3DCreate9 entry patch + sanitized-mode wrap is armed from the
+    // diversion paths themselves (see EnsureD3D9Patched), not from here: the
+    // engine resolves the proc pointer before DirectInput8Create runs.
 }
 
 // ---------------------------------------------------------------- level 1: exe IAT (startup path)
@@ -174,7 +189,11 @@ static HMODULE WINAPI IatMyLoadLibraryA(LPCSTR file)
     if (RedirectLegacyName(file, redirect, sizeof redirect) && _stricmp(file, redirect) != 0)
     {
         Trace("LoadLibraryA(iat)", file, redirect);
+        const bool d3d9 = strlen(redirect) >= 8 && _stricmp(redirect + strlen(redirect) - 8, "d3d9.dll") == 0;
         file = redirect;
+        HMODULE h = IatLoadLibraryA(file);
+        if (d3d9 && h != nullptr && PatchD3D9ExportEnabled()) EnsureD3D9Patched();
+        return h;
     }
     return IatLoadLibraryA(file);
 }
@@ -261,8 +280,8 @@ static D3D9HRESULT WINAPI WrapGetAdapterModeCount(IDirect3D9Like self, UINT adap
 {
     using PFn = D3D9HRESULT (WINAPI *)(IDirect3D9Like, UINT, DWORD);
     void **vt = *reinterpret_cast<void ***>(self);
-    const UINT n = static_cast<UINT>(reinterpret_cast<PFn>(vt[6])(self, adapter, fmt));
-    return static_cast<D3D9HRESULT>(n < kMaxModesReported ? n : kMaxModesReported);
+    reinterpret_cast<PFn>(vt[6])(self, adapter, fmt);   // touch, then ignore
+    return 1;   // one sanitized mode (see below)
 }
 
 struct D3DDisplayModeLike { UINT Width, Height, RefreshRate; DWORD Format; };
@@ -271,9 +290,22 @@ static D3D9HRESULT WINAPI WrapEnumAdapterModes(IDirect3D9Like self, UINT adapter
                                                D3DDisplayModeLike *dm)
 {
     using PFn = D3D9HRESULT (WINAPI *)(IDirect3D9Like, UINT, DWORD, UINT, D3DDisplayModeLike *);
-    if (mode >= kMaxModesReported) return 0x887608C2;   // D3DERR_INVALIDCALL
     void **vt = *reinterpret_cast<void ***>(self);
-    return reinterpret_cast<PFn>(vt[7])(self, adapter, fmt, mode, dm);
+    if (dm == nullptr)
+        return reinterpret_cast<PFn>(vt[7])(self, adapter, fmt, mode, dm);
+    if (mode > 0) return 0x887608C2;   // D3DERR_INVALIDCALL: we report one mode
+    dm->Width = 3840; dm->Height = 2160; dm->RefreshRate = 60; dm->Format = fmt;
+    return 0;   // D3D_OK
+}
+
+static D3D9HRESULT WINAPI WrapGetAdapterDisplayMode(IDirect3D9Like self, UINT adapter, D3DDisplayModeLike *dm)
+{
+    using PFn = D3D9HRESULT (WINAPI *)(IDirect3D9Like, UINT, D3DDisplayModeLike *);
+    void **vt = *reinterpret_cast<void ***>(self);
+    if (dm == nullptr)
+        return reinterpret_cast<PFn>(vt[8])(self, adapter, dm);
+    dm->Width = 3840; dm->Height = 2160; dm->RefreshRate = 60;
+    return 0;
 }
 
 static void *g_d3d9_vtable[kVtableEntries];   // shared: wrappers are stateless
@@ -288,6 +320,7 @@ static IDirect3D9Like WrapD3D9Object(IDirect3D9Like obj)
         g_d3d9_vtable[5] = &WrapGetAdapterIdentifier;
         g_d3d9_vtable[6] = &WrapGetAdapterModeCount;
         g_d3d9_vtable[7] = &WrapEnumAdapterModes;
+        g_d3d9_vtable[8] = &WrapGetAdapterDisplayMode;
         g_d3d9_vtable_ready = true;
     }
     *reinterpret_cast<void ***>(obj) = g_d3d9_vtable;
@@ -304,24 +337,59 @@ static IDirect3D9Like WINAPI MyDirect3DCreate9(UINT sdk)
     return WrapD3D9Object(obj);
 }
 
-// Hook the Direct3DCreate9 export of the (already diverted) dgVoodoo D3D9.dll.
-static void InstallD3D9Hooks()
+// Patch the Direct3DCreate9 ENTRY POINT of the diverted dgVoodoo D3D9.dll
+// with a 5-byte JMP, right after it loads: the engine caches the proc pointer
+// at its first load -- before DirectInput8Create and thus before the MinHook
+// hooks arm -- so an export patch applied inside the diversion itself is the
+// only interception guaranteed to be in place in time. Only applied when the
+// prologue is the classic position-independent hot-patch pattern.
+#pragma pack(push, 1)
+struct Jump5 { uint8_t opcode; int32_t rel; };
+#pragma pack(pop)
+
+static uint8_t g_d3d9_trampoline[16];   // displaced bytes + JMP back
+static bool    g_d3d9_patched = false;
+
+static void PatchD3D9Export(HMODULE d3d9)
 {
-    char dir[MAX_PATH] = {};
+    if (g_d3d9_patched || d3d9 == nullptr) return;
+    uint8_t *fn = reinterpret_cast<uint8_t *>(GetProcAddress(d3d9, "Direct3DCreate9"));
+    if (fn == nullptr) return;
+    static const uint8_t kClassic[] = { 0x8B, 0xFF, 0x55, 0x8B, 0xEC };  // mov edi,edi; push ebp; mov ebp,esp
+    if (memcmp(fn, kClassic, sizeof kClassic) != 0)
+    { Trace("d3d9 export: unfamiliar prologue, not patched", "", nullptr); g_d3d9_patched = true; return; }
+
+    memcpy(g_d3d9_trampoline, fn, 5);
+    auto *back = reinterpret_cast<Jump5 *>(g_d3d9_trampoline + 5);
+    back->opcode = 0xE9;
+    back->rel = static_cast<int32_t>(reinterpret_cast<intptr_t>(fn + 5) -
+                                     reinterpret_cast<intptr_t>(back + 1));
+
+    DWORD old = 0;
+    if (!VirtualProtect(fn, 5, PAGE_EXECUTE_READWRITE, &old)) return;
+    auto *jmp = reinterpret_cast<Jump5 *>(fn);
+    jmp->opcode = 0xE9;
+    jmp->rel = static_cast<int32_t>(reinterpret_cast<intptr_t>(&MyDirect3DCreate9) -
+                                    reinterpret_cast<intptr_t>(fn + 5));
+    VirtualProtect(fn, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), fn, 5);
+    RealDirect3DCreate9 = reinterpret_cast<PDirect3DCreate9>(static_cast<void *>(g_d3d9_trampoline));
+    g_d3d9_patched = true;
+    Trace("d3d9 export: Direct3DCreate9 entry patched", "", nullptr);
+}
+
+// Called from both diversion paths with the freshly loaded module -- before
+// the engine can resolve anything from it.
+static void EnsureD3D9Patched()
+{
+    char dir[MAX_PATH] = {}, path[MAX_PATH] = {};
     HMODULE self = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCSTR>(&InstallD3D9Hooks), &self);
+                       reinterpret_cast<LPCSTR>(&EnsureD3D9Patched), &self);
     if (self == nullptr || !DirOf(self, dir, sizeof dir)) return;
-    char path[MAX_PATH];
     sprintf_s(path, "%s\\d3d9.dll", dir);
-    HMODULE d3d9 = GetModuleHandleA(path);        // the diverted dgVoodoo copy, if loaded
-    if (d3d9 == nullptr) d3d9 = LoadLibraryA(path);
-    if (d3d9 == nullptr) return;
-    void *target = reinterpret_cast<void *>(GetProcAddress(d3d9, "Direct3DCreate9"));
-    if (target == nullptr) return;
-    if (MH_CreateHook(target, &MyDirect3DCreate9, reinterpret_cast<void **>(&RealDirect3DCreate9)) == MH_OK &&
-        MH_EnableHook(target) == MH_OK)
-        Trace("hooks: Direct3DCreate9 armed", "", nullptr);
+    HMODULE d3d9 = GetModuleHandleA(path);
+    if (d3d9 != nullptr) PatchD3D9Export(d3d9);
 }
 
 // ---------------------------------------------------------------- dinput8 forward
