@@ -54,3 +54,13 @@ layer/x86/*.pdb
 # binaries, so only the author's interop docs and checksums are tracked. See README credits.
 external/deepfried/**/*.dll
 external/deepfried/**/*.cfg
+
+# fsr41: build outputs live in build\; AMD runtime DLLs live only in deploy\
+# (fetched by deploy\fetch-deps.ps1). Nothing binary is tracked.
+external/ffx/bin/
+tools/dinput-redirect/*.dll
+tools/dinput-redirect/*.disabled
+tools/ffx-smoke/*.exe
+tools/ffx-smoke/*.dll
+tools/ffx-smoke/*.bmp
+tools/ffx-smoke/*.log
