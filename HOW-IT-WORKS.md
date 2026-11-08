@@ -378,3 +378,15 @@ Engine builds differ in their D3D usage (classic vs Ex, mode parsing, anti-wrapp
 - **Driver**: AMD Adrenalin 26.10.1 or newer (brought FSR 4.1 to RDNA 2)
 - **OS**: Windows 10/11 (D3D11 + DXGI required)
 - **Performance**: ~2.7 ms GPU per frame at 1600×1200 NativeAA, ~8 ms at 1080p→4K SR mode on RX 6750 XT
+
+---
+
+## Known Limitation: SR Mode on Legacy Content
+
+Setting `work_upscale=2` with `work_resolution<100` (SR mode: render lower → ML upscale to native) produces **visible artifacts on 2003-era games**:
+
+- **Pixelation**: the ML model was trained on modern game content with detailed textures; on hard-edged low-detail 2003-era art, its reconstruction is worse than a simple bilinear at full resolution
+- **Disappearing small objects**: the optical-flow MVs (LumeniteFX) cannot track small fast-moving objects (game cursor, 16×16 px at 63% scale); the temporal reconstruction drops them between frames
+- **Temporal jitter**: the synthetic Halton jitter (needed for SR reconstruction) combined with noisy optical-flow MVs causes unstable frame-to-frame accumulation, visible as shimmer
+
+**Recommendation**: use `work_upscale=0` + `work_resolution=100` (NativeAA 1:1) — full-resolution render with FSR 4.1 as pure ML anti-aliasing/edge enhancement. No temporal artifacts, no resolution loss, ~12 ms GPU at 4K on RX 6750 XT. SR mode is only worth trying on games with modern, high-detail rendering where the ML model has enough information to work with.
