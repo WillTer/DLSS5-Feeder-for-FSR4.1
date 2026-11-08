@@ -355,7 +355,7 @@ static void PatchExeIat()
 
 // The wrapped object's vtable points at OUR wrappers; the wrappers must call
 // the ORIGINAL dgVoodoo methods, saved before the swap.
-static void *g_orig_vt_slot[16] = {};
+static void *g_orig_vt_slot[24] = {};
 
 static void *vt_orig(int slot)
 {
@@ -462,7 +462,7 @@ static IDirect3D9Like WrapD3D9Object(IDirect3D9Like obj)
     if (!g_d3d9_vtable_ready)
     {
         memcpy(g_d3d9_vtable, *reinterpret_cast<void ***>(obj), sizeof(g_d3d9_vtable));
-        for (int s = 0; s < 16; ++s) g_orig_vt_slot[s] = g_d3d9_vtable[s];
+        for (int s = 0; s < 24; ++s) g_orig_vt_slot[s] = g_d3d9_vtable[s];
         g_d3d9_vtable[4] = &WrapGetAdapterCount;
         g_d3d9_vtable[5] = &WrapGetAdapterIdentifier;
         g_d3d9_vtable[6] = &WrapGetAdapterModeCount;
