@@ -198,6 +198,61 @@ static HMODULE WINAPI IatMyLoadLibraryA(LPCSTR file)
     return IatLoadLibraryA(file);
 }
 
+// The engine resolves Direct3DCreate9/9Ex through GetProcAddress at its
+// first d3d9 load -- hand it OUR entry instead. No foreign bytes are touched
+// (unlike the entry-point patch experiment), so nothing can be checksummed.
+typedef void *IDirect3D9Like;
+typedef IDirect3D9Like (WINAPI *PDirect3DCreate9)(UINT);
+typedef long (WINAPI *PDirect3DCreate9Ex)(UINT, void **);
+static PDirect3DCreate9   RealDirect3DCreate9 = nullptr;
+static PDirect3DCreate9Ex RealDirect3DCreate9Ex = nullptr;
+
+static FARPROC (WINAPI *IatGetProcAddress)(HMODULE, LPCSTR) = nullptr;
+
+static bool IsOurD3D9(HMODULE h)
+{
+    if (h == nullptr) return false;
+    char path[MAX_PATH] = {}, dir[MAX_PATH] = {}, want[MAX_PATH] = {};
+    if (GetModuleFileNameA(h, path, MAX_PATH) == 0) return false;
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(&IsOurD3D9), &self);
+    if (self == nullptr || !DirOf(self, dir, sizeof dir)) return false;
+    sprintf_s(want, "%s\d3d9.dll", dir);
+    return _stricmp(path, want) == 0;
+}
+
+static IDirect3D9Like WINAPI MyDirect3DCreate9(UINT sdk);   // defined in the wrap section
+static long WINAPI MyDirect3DCreate9Ex(UINT sdk, void **out);
+
+static FARPROC WINAPI IatMyGetProcAddress(HMODULE h, LPCSTR name)
+{
+    if (name != nullptr && IsOurD3D9(h))
+    {
+        if (strcmp(name, "Direct3DCreate9") == 0)
+        {
+            if (RealDirect3DCreate9 == nullptr)
+                RealDirect3DCreate9 = reinterpret_cast<PDirect3DCreate9>(IatGetProcAddress(h, name));
+            if (RealDirect3DCreate9 != nullptr)
+            {
+                Trace("GetProcAddress: Direct3DCreate9 -> wrapped", "", nullptr);
+                return reinterpret_cast<FARPROC>(&MyDirect3DCreate9);
+            }
+        }
+        if (strcmp(name, "Direct3DCreate9Ex") == 0)
+        {
+            if (RealDirect3DCreate9Ex == nullptr)
+                RealDirect3DCreate9Ex = reinterpret_cast<PDirect3DCreate9Ex>(IatGetProcAddress(h, name));
+            if (RealDirect3DCreate9Ex != nullptr)
+            {
+                Trace("GetProcAddress: Direct3DCreate9Ex -> wrapped", "", nullptr);
+                return reinterpret_cast<FARPROC>(&MyDirect3DCreate9Ex);
+            }
+        }
+    }
+    return IatGetProcAddress(h, name);
+}
+
 static void PatchExeIat()
 {
     uint8_t *base = reinterpret_cast<uint8_t *>(GetModuleHandleW(nullptr));
@@ -220,15 +275,29 @@ static void PatchExeIat()
         {
             if (names[i].u1.Ordinal & IMAGE_ORDINAL_FLAG32) continue;
             const char *fn = reinterpret_cast<const char *>(base + names[i].u1.AddressOfData + 2);
-            if (strcmp(fn, "LoadLibraryA") != 0) continue;
             DWORD old = 0;
-            if (VirtualProtect(&thunk[i].u1.Function, sizeof(void *), PAGE_READWRITE, &old))
+            if (strcmp(fn, "LoadLibraryA") == 0)
             {
-                IatLoadLibraryA = reinterpret_cast<HMODULE (WINAPI *)(LPCSTR)>(thunk[i].u1.Function);
-                thunk[i].u1.Function = reinterpret_cast<uintptr_t>(&IatMyLoadLibraryA);
-                VirtualProtect(&thunk[i].u1.Function, sizeof(void *), old, &old);
+                if (VirtualProtect(&thunk[i].u1.Function, sizeof(void *), PAGE_READWRITE, &old))
+                {
+                    IatLoadLibraryA = reinterpret_cast<HMODULE (WINAPI *)(LPCSTR)>(thunk[i].u1.Function);
+                    thunk[i].u1.Function = reinterpret_cast<uintptr_t>(&IatMyLoadLibraryA);
+                    VirtualProtect(&thunk[i].u1.Function, sizeof(void *), old, &old);
+                }
             }
-            return;
+            else if (strcmp(fn, "GetProcAddress") == 0)
+            {
+                if (VirtualProtect(&thunk[i].u1.Function, sizeof(void *), PAGE_READWRITE, &old))
+                {
+                    IatGetProcAddress = reinterpret_cast<FARPROC (WINAPI *)(HMODULE, LPCSTR)>(thunk[i].u1.Function);
+                    thunk[i].u1.Function = reinterpret_cast<uintptr_t>(&IatMyGetProcAddress);
+                    VirtualProtect(&thunk[i].u1.Function, sizeof(void *), old, &old);
+                    Trace("hooks: exe GetProcAddress IAT hooked", "", nullptr);
+                }
+            }
+            // keep scanning: kernel32 imports both functions, and a stray early
+            // return here once cost us every hook (v6 bug -- it inspected only
+            // the first thunk and installed nothing).
         }
     }
 }
@@ -244,11 +313,23 @@ static void PatchExeIat()
 //   3 RegisterSoftwareDevice, 4 GetAdapterCount, 5 GetAdapterIdentifier,
 //   6 GetAdapterModeCount, 7 EnumAdapterModes, 8 GetAdapterDisplayMode, ...
 
+// The wrapped object's vtable points at OUR wrappers; the wrappers must call
+// the ORIGINAL dgVoodoo methods, saved before the swap.
+static void *g_orig_vt_slot[16] = {};
+
+static void *vt_orig(int slot)
+{
+    return g_orig_vt_slot[slot & 15];
+}
+
+static void *vt_orig6() { return vt_orig(6); }
+static void *vt_orig7() { return vt_orig(7); }
+static void *vt_orig8() { return vt_orig(8); }
+
 static const UINT  kMaxModesReported = 24;
 static const DWORD kVtableEntries   = 64;   // IDirect3D9Ex is longer; be safe
 
-typedef long D3D9HRESULT;
-typedef void *IDirect3D9Like;               // we only touch the vtable pointer
+typedef long D3D9HRESULT;                   // IDirect3D9Like: declared above
 
 struct D3DAdapterIdentifier9Like
 {
@@ -262,26 +343,42 @@ struct D3DAdapterIdentifier9Like
     DWORD WHQLLevel;
 };
 
+static D3D9HRESULT WINAPI WrapGetAdapterCount(IDirect3D9Like self)
+{
+    (void)self;
+    return 1;   // the engine chokes on the second (portrait) monitor
+}
+
 static D3D9HRESULT WINAPI WrapGetAdapterIdentifier(IDirect3D9Like self, UINT adapter, DWORD flags,
                                                    D3DAdapterIdentifier9Like *id)
 {
     using PFn = D3D9HRESULT (WINAPI *)(IDirect3D9Like, UINT, DWORD, D3DAdapterIdentifier9Like *);
-    void **vt = *reinterpret_cast<void ***>(self);
-    D3D9HRESULT hr = reinterpret_cast<PFn>(vt[5])(self, adapter, flags, id);
-    if (SUCCEEDED(hr) && id != nullptr)
-    {
-        id->Description[28] = 0;   // "dgVoodoo DX API Layer" suffix gone
-        id->Driver[28] = 0;
-    }
-    return hr;
+    return reinterpret_cast<PFn>(vt_orig(5))(self, adapter, flags, id);
 }
+
+// The 2003 engine cannot digest what a modern desktop reports through
+// dgVoodoo: 54 modes per format overflows its fixed arrays, and a second
+// (portrait) monitor confuses its adapter walk -- its log then fills with
+// garbage and it asserts. Feed it the classic diet it was built for.
+struct ClassicMode { UINT w, h; };
+static const ClassicMode kClassicModes[] = {
+    { 640, 480 }, { 800, 600 }, { 1024, 768 }, { 1152, 864 },
+    { 1280, 960 }, { 1280, 1024 }, { 1600, 1200 },
+    { 1920, 1080 }, { 2560, 1440 }, { 3840, 2160 },   // match the reported display mode
+};
+static const UINT kClassicModeCount = sizeof(kClassicModes) / sizeof(kClassicModes[0]);
+
+static int g_mode_logs = 0;
 
 static D3D9HRESULT WINAPI WrapGetAdapterModeCount(IDirect3D9Like self, UINT adapter, DWORD fmt)
 {
-    using PFn = D3D9HRESULT (WINAPI *)(IDirect3D9Like, UINT, DWORD);
-    void **vt = *reinterpret_cast<void ***>(self);
-    reinterpret_cast<PFn>(vt[6])(self, adapter, fmt);   // touch, then ignore
-    return 1;   // one sanitized mode (see below)
+    (void)self; (void)adapter; (void)fmt;
+    if (g_mode_logs < 8)
+    {
+        Trace("modeCount -> classic list", "", nullptr);
+        ++g_mode_logs;
+    }
+    return static_cast<D3D9HRESULT>(kClassicModeCount);
 }
 
 struct D3DDisplayModeLike { UINT Width, Height, RefreshRate; DWORD Format; };
@@ -290,22 +387,30 @@ static D3D9HRESULT WINAPI WrapEnumAdapterModes(IDirect3D9Like self, UINT adapter
                                                D3DDisplayModeLike *dm)
 {
     using PFn = D3D9HRESULT (WINAPI *)(IDirect3D9Like, UINT, DWORD, UINT, D3DDisplayModeLike *);
-    void **vt = *reinterpret_cast<void ***>(self);
-    if (dm == nullptr)
-        return reinterpret_cast<PFn>(vt[7])(self, adapter, fmt, mode, dm);
-    if (mode > 0) return 0x887608C2;   // D3DERR_INVALIDCALL: we report one mode
-    dm->Width = 3840; dm->Height = 2160; dm->RefreshRate = 60; dm->Format = fmt;
+    (void)self; (void)adapter;
+    if (mode >= kClassicModeCount) return 0x887608C2;   // D3DERR_INVALIDCALL
+    if (dm != nullptr)
+    {
+        dm->Width = kClassicModes[mode].w;
+        dm->Height = kClassicModes[mode].h;
+        dm->RefreshRate = 60;
+        dm->Format = fmt;
+    }
     return 0;   // D3D_OK
 }
 
 static D3D9HRESULT WINAPI WrapGetAdapterDisplayMode(IDirect3D9Like self, UINT adapter, D3DDisplayModeLike *dm)
 {
     using PFn = D3D9HRESULT (WINAPI *)(IDirect3D9Like, UINT, D3DDisplayModeLike *);
-    void **vt = *reinterpret_cast<void ***>(self);
-    if (dm == nullptr)
-        return reinterpret_cast<PFn>(vt[8])(self, adapter, dm);
-    dm->Width = 3840; dm->Height = 2160; dm->RefreshRate = 60;
-    return 0;
+    const D3D9HRESULT hr = reinterpret_cast<PFn>(vt_orig8())(self, adapter, dm);
+    if (SUCCEEDED(hr) && dm != nullptr)
+    {
+        char msg[128];
+        sprintf_s(msg, "displayMode(adapter=%u): %ux%u@%lu fmt=%lu", adapter,
+                  dm->Width, dm->Height, dm->RefreshRate, dm->Format);
+        Trace(msg, "", nullptr);
+    }
+    return hr;
 }
 
 static void *g_d3d9_vtable[kVtableEntries];   // shared: wrappers are stateless
@@ -317,6 +422,8 @@ static IDirect3D9Like WrapD3D9Object(IDirect3D9Like obj)
     if (!g_d3d9_vtable_ready)
     {
         memcpy(g_d3d9_vtable, *reinterpret_cast<void ***>(obj), sizeof(g_d3d9_vtable));
+        for (int s = 0; s < 16; ++s) g_orig_vt_slot[s] = g_d3d9_vtable[s];
+        g_d3d9_vtable[4] = &WrapGetAdapterCount;
         g_d3d9_vtable[5] = &WrapGetAdapterIdentifier;
         g_d3d9_vtable[6] = &WrapGetAdapterModeCount;
         g_d3d9_vtable[7] = &WrapEnumAdapterModes;
@@ -327,14 +434,22 @@ static IDirect3D9Like WrapD3D9Object(IDirect3D9Like obj)
     return obj;
 }
 
-typedef IDirect3D9Like (WINAPI *PDirect3DCreate9)(UINT);
-static PDirect3DCreate9 RealDirect3DCreate9 = nullptr;
-
 static IDirect3D9Like WINAPI MyDirect3DCreate9(UINT sdk)
 {
     const IDirect3D9Like obj = RealDirect3DCreate9(sdk);
     Trace("Direct3DCreate9 wrapped", "", nullptr);
     return WrapD3D9Object(obj);
+}
+
+static long WINAPI MyDirect3DCreate9Ex(UINT sdk, void **out)
+{
+    const long hr = RealDirect3DCreate9Ex(sdk, out);
+    if (SUCCEEDED(hr) && out != nullptr && *out != nullptr)
+    {
+        Trace("Direct3DCreate9Ex wrapped", "", nullptr);
+        WrapD3D9Object(reinterpret_cast<IDirect3D9Like>(*out));
+    }
+    return hr;
 }
 
 // Patch the Direct3DCreate9 ENTRY POINT of the diverted dgVoodoo D3D9.dll
@@ -347,7 +462,10 @@ static IDirect3D9Like WINAPI MyDirect3DCreate9(UINT sdk)
 struct Jump5 { uint8_t opcode; int32_t rel; };
 #pragma pack(pop)
 
-static uint8_t g_d3d9_trampoline[16];   // displaced bytes + JMP back
+static uint8_t *g_d3d9_trampoline = nullptr;   // RWX via VirtualAlloc: a .data
+                                               // buffer is not executable (DEP) --
+                                               // that, not an engine checksum, is
+                                               // what killed the first attempt
 static bool    g_d3d9_patched = false;
 
 static void PatchD3D9Export(HMODULE d3d9)
@@ -359,6 +477,9 @@ static void PatchD3D9Export(HMODULE d3d9)
     if (memcmp(fn, kClassic, sizeof kClassic) != 0)
     { Trace("d3d9 export: unfamiliar prologue, not patched", "", nullptr); g_d3d9_patched = true; return; }
 
+    if (g_d3d9_trampoline == nullptr)
+        g_d3d9_trampoline = static_cast<uint8_t *>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (g_d3d9_trampoline == nullptr) return;
     memcpy(g_d3d9_trampoline, fn, 5);
     auto *back = reinterpret_cast<Jump5 *>(g_d3d9_trampoline + 5);
     back->opcode = 0xE9;
