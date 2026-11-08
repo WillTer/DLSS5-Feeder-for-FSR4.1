@@ -5343,7 +5343,20 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
     if (dev_api->get_api() == reshade::api::device_api::d3d10)
     { g.is_d3d10 = true; FeedFrame10(rt, rtv); return; }
     if (dev_api->get_api() != reshade::api::device_api::d3d11)
-    { FeedDisable("only Direct3D 10, Direct3D 11, OpenGL and Vulkan games are supported by the " FEED_HALF_NAME " add-on"); return; }
+    {
+        // Under dgVoodoo, ReShade may initialize a D3D9 runtime on the wrapped
+        // D3D9 swapchain alongside the D3D11 one on the real (DXGI) swapchain.
+        // Do NOT self-disable: just skip this runtime's frames and wait for
+        // the D3D11 runtime to appear -- that is where the feeder lives.
+        static bool said_d3d9 = false;
+        if (!said_d3d9)
+        {
+            said_d3d9 = true;
+            Log("[feed32] skipping a non-D3D11 runtime (API %d); waiting for the D3D11 one (dgVoodoo path)",
+                static_cast<int>(dev_api->get_api()));
+        }
+        return;
+    }
 
     auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;

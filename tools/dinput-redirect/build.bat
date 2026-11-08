@@ -7,7 +7,7 @@ setlocal
 call "%~dp0..\vcvars.bat" amd64_x86 || exit /b 1
 set "ROOT=%~dp0..\.."
 if not exist "%ROOT%\build" mkdir "%ROOT%\build"
-cl /nologo /LD /O2 /W4 /MT /I"%ROOT%\external\minhook\include" ^
+cl /nologo /LD /O2 /W3 /MT /I"%ROOT%\external\minhook\include" /I"%ROOT%\external\minhook\src\hde" ^
    dinput8_redirect.cpp ^
    "%ROOT%\external\minhook\src\buffer.c" "%ROOT%\external\minhook\src\hook.c" ^
    "%ROOT%\external\minhook\src\trampoline.c" "%ROOT%\external\minhook\src\hde\hde32.c" ^
